@@ -1,0 +1,10 @@
+# CreativeItem Configuration
+
+# Lore text for creative items
+CreativeItemLore: "&c&lCreative Item"
+
+# Whether to log creative item removal
+LogRemovals: true
+
+# Whether to allow admins to bypass restrictions
+AdminBypass: true

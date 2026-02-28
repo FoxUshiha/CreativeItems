@@ -1,0 +1,20 @@
+name: CreativeItem
+version: 1.1
+main: com.foxsrv.creativeitem.CreativeItem
+api-version: 1.20
+author: FoxOficial2
+description: Creative item management system
+
+commands:
+  creativeitem:
+    description: Main creative item command
+    usage: /creativeitem remove
+    aliases: [ci]
+  ci:
+    description: Alias for /creativeitem
+    usage: /ci remove
+
+permissions:
+  creativeitem.admin:
+    description: Allows bypassing creative item restrictions
+    default: op
