@@ -9,13 +9,18 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
+import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.GlowItemFrame;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemSpawnEvent;
+import org.bukkit.event.hanging.HangingPlaceEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCreativeEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
@@ -24,6 +29,8 @@ import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerGameModeChangeEvent;
+import org.bukkit.event.player.PlayerInteractAtEntityEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -64,6 +71,8 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
     private String creativeLore;
     private boolean logRemovals;
     private boolean adminBypass;
+    private Set<Material> blacklistedMaterials = new HashSet<>();
+    private List<MaterialPattern> blacklistPatterns = new ArrayList<>();
     
     // List of inventory types that are considered "storage" (not player inventory)
     private final Set<InventoryType> storageInventories = EnumSet.of(
@@ -90,6 +99,13 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         InventoryType.CRAFTING,
         InventoryType.WORKBENCH
     );
+    
+    // Entities that can hold items
+    private final Set<Class<?>> itemHolderEntities = new HashSet<>(Arrays.asList(
+        ItemFrame.class,
+        GlowItemFrame.class,
+        ArmorStand.class
+    ));
     
     public static CreativeItem get() { return instance; }
     
@@ -121,6 +137,9 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Start periodic cleanup task for any stray creative items
         startCleanupTask();
         
+        // Start blacklist check task
+        startBlacklistCheckTask();
+        
         getLogger().info("CreativeItem v" + getDescription().getVersion() + " enabled!");
     }
     
@@ -142,12 +161,74 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         reloadPluginConfig();
     }
     
+    /**
+     * Helper class for pattern matching materials with wildcards
+     */
+    private static class MaterialPattern {
+        private final String pattern;
+        private final boolean startsWithWildcard;
+        private final boolean endsWithWildcard;
+        private final String cleanPattern;
+        
+        MaterialPattern(String pattern) {
+            this.pattern = pattern.toUpperCase();
+            this.startsWithWildcard = this.pattern.startsWith("*");
+            this.endsWithWildcard = this.pattern.endsWith("*");
+            
+            if (startsWithWildcard && endsWithWildcard) {
+                this.cleanPattern = this.pattern.substring(1, this.pattern.length() - 1);
+            } else if (startsWithWildcard) {
+                this.cleanPattern = this.pattern.substring(1);
+            } else if (endsWithWildcard) {
+                this.cleanPattern = this.pattern.substring(0, this.pattern.length() - 1);
+            } else {
+                this.cleanPattern = this.pattern;
+            }
+        }
+        
+        boolean matches(Material material) {
+            String name = material.name();
+            
+            if (startsWithWildcard && endsWithWildcard) {
+                return name.contains(cleanPattern);
+            } else if (startsWithWildcard) {
+                return name.endsWith(cleanPattern);
+            } else if (endsWithWildcard) {
+                return name.startsWith(cleanPattern);
+            } else {
+                return name.equals(cleanPattern);
+            }
+        }
+    }
+    
     private void reloadPluginConfig() {
         this.config = getConfig();
         this.creativeLore = ChatColor.translateAlternateColorCodes('&', 
             config.getString("CreativeItemLore", "&c&lCreative Item"));
         this.logRemovals = config.getBoolean("LogRemovals", true);
         this.adminBypass = config.getBoolean("AdminBypass", true);
+        
+        // Load blacklist with pattern support
+        blacklistedMaterials.clear();
+        blacklistPatterns.clear();
+        List<String> blacklist = config.getStringList("Blacklist");
+        for (String materialName : blacklist) {
+            materialName = materialName.toUpperCase().trim();
+            
+            // Check if it contains wildcards
+            if (materialName.contains("*")) {
+                blacklistPatterns.add(new MaterialPattern(materialName));
+                getLogger().info("Blacklisted pattern: " + materialName);
+            } else {
+                try {
+                    Material material = Material.valueOf(materialName);
+                    blacklistedMaterials.add(material);
+                    getLogger().info("Blacklisted material: " + materialName);
+                } catch (IllegalArgumentException e) {
+                    getLogger().warning("Invalid material in blacklist: " + materialName);
+                }
+            }
+        }
     }
     
     /**
@@ -184,6 +265,22 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
     }
     
     /**
+     * Start periodic blacklist check task
+     */
+    private void startBlacklistCheckTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                        checkAndRemoveBlacklistedItems(player);
+                    }
+                }
+            }
+        }.runTaskTimer(this, 10L, 10L); // Run every 0.5 seconds for immediate removal
+    }
+    
+    /**
      * Check if player has admin bypass permission
      */
     private boolean hasAdminBypass(Player player) {
@@ -195,6 +292,18 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
      */
     private boolean isStorageInventory(InventoryType type) {
         return storageInventories.contains(type);
+    }
+    
+    /**
+     * Check if an entity is an item holder (item frame, armor stand, etc.)
+     */
+    private boolean isItemHolderEntity(Entity entity) {
+        for (Class<?> holderClass : itemHolderEntities) {
+            if (holderClass.isInstance(entity)) {
+                return true;
+            }
+        }
+        return false;
     }
     
     /**
@@ -210,6 +319,56 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         List<String> lore = meta.getLore();
         return lore != null && lore.contains(creativeLore);
+    }
+    
+    /**
+     * Check if an item is blacklisted (supports wildcards)
+     */
+    private boolean isBlacklisted(ItemStack item) {
+        if (item == null || item.getType() == Material.AIR) return false;
+        
+        Material material = item.getType();
+        
+        // Check exact matches
+        if (blacklistedMaterials.contains(material)) {
+            return true;
+        }
+        
+        // Check patterns
+        for (MaterialPattern pattern : blacklistPatterns) {
+            if (pattern.matches(material)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check and remove blacklisted items from player
+     */
+    private void checkAndRemoveBlacklistedItems(Player player) {
+        boolean removed = false;
+        
+        // Check main hand
+        ItemStack mainHand = player.getInventory().getItemInMainHand();
+        if (isBlacklisted(mainHand)) {
+            player.getInventory().setItemInMainHand(null);
+            player.sendMessage(ChatColor.RED + "Blacklisted item removed from your hand!");
+            removed = true;
+        }
+        
+        // Check off hand
+        ItemStack offHand = player.getInventory().getItemInOffHand();
+        if (isBlacklisted(offHand)) {
+            player.getInventory().setItemInOffHand(null);
+            player.sendMessage(ChatColor.RED + "Blacklisted item removed from your off hand!");
+            removed = true;
+        }
+        
+        if (removed && logRemovals) {
+            getLogger().info("Removed blacklisted items from " + player.getName());
+        }
     }
     
     /**
@@ -388,6 +547,24 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Skip if player has admin bypass
         if (hasAdminBypass(player)) return;
         
+        // Check for blacklisted items
+        if (player.getGameMode() == GameMode.CREATIVE) {
+            if (isBlacklisted(current)) {
+                event.setCancelled(true);
+                if (current != null) {
+                    current.setAmount(0);
+                }
+                player.sendMessage(ChatColor.RED + "You cannot use blacklisted items in creative!");
+                return;
+            }
+            if (isBlacklisted(cursor)) {
+                event.setCancelled(true);
+                event.setCursor(null);
+                player.sendMessage(ChatColor.RED + "You cannot use blacklisted items in creative!");
+                return;
+            }
+        }
+        
         // Allow all interactions within player's own inventory or creative inventory
         if (clickedInventory != null && 
             (clickedInventory.getType() == InventoryType.PLAYER || 
@@ -448,6 +625,14 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         // Skip if admin bypass
         if (hasAdminBypass(player)) return;
+        
+        // Check for blacklisted items
+        if (player.getGameMode() == GameMode.CREATIVE && isBlacklisted(oldCursor)) {
+            event.setCancelled(true);
+            event.setCursor(null);
+            player.sendMessage(ChatColor.RED + "You cannot use blacklisted items in creative!");
+            return;
+        }
         
         // Check if dragging creative item
         if (isCreativeItem(oldCursor)) {
@@ -558,6 +743,13 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Skip if admin bypass
         if (hasAdminBypass(player)) return;
         
+        // Prevent creative players from picking up dropped items
+        if (player.getGameMode() == GameMode.CREATIVE) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "Creative players cannot pick up dropped items!");
+            return;
+        }
+        
         // Prevent picking up creative items if not in creative mode
         if (isCreativeItem(itemStack)) {
             if (player.getGameMode() != GameMode.CREATIVE) {
@@ -572,7 +764,104 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
     }
     
     /**
-     * Handle player interaction (right-click on chests, etc.)
+     * Handle player interaction with entities (item frames, armor stands, etc.)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerInteractEntity(PlayerInteractEntityEvent event) {
+        Player player = event.getPlayer();
+        Entity entity = event.getRightClicked();
+        ItemStack item = player.getInventory().getItemInMainHand();
+        
+        // Skip if admin bypass
+        if (hasAdminBypass(player)) return;
+        
+        // Check if interacting with item holder entity in creative mode
+        if (player.getGameMode() == GameMode.CREATIVE && isItemHolderEntity(entity)) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "You cannot place items on " + 
+                entity.getType().name().toLowerCase().replace("_", " ") + 
+                " while in creative mode!");
+            
+            if (logRemovals) {
+                getLogger().info("Prevented " + player.getName() + " from placing item on " + 
+                    entity.getType().name() + " in creative mode");
+            }
+            return;
+        }
+        
+        // Check if holding creative item in survival
+        if (isCreativeItem(item) && player.getGameMode() != GameMode.CREATIVE) {
+            event.setCancelled(true);
+            player.getInventory().remove(item);
+            player.sendMessage(ChatColor.RED + "Creative item removed!");
+        }
+    }
+    
+    /**
+     * Handle player interaction with entities (specifically for armor stands)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerInteractAtEntity(PlayerInteractAtEntityEvent event) {
+        Player player = event.getPlayer();
+        Entity entity = event.getRightClicked();
+        ItemStack item = player.getInventory().getItemInMainHand();
+        
+        // Skip if admin bypass
+        if (hasAdminBypass(player)) return;
+        
+        // Check if interacting with armor stand in creative mode
+        if (player.getGameMode() == GameMode.CREATIVE && entity instanceof ArmorStand) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "You cannot interact with armor stands while in creative mode!");
+            
+            if (logRemovals) {
+                getLogger().info("Prevented " + player.getName() + " from interacting with armor stand in creative mode");
+            }
+            return;
+        }
+        
+        // Check if holding creative item in survival
+        if (isCreativeItem(item) && player.getGameMode() != GameMode.CREATIVE) {
+            event.setCancelled(true);
+            player.getInventory().remove(item);
+            player.sendMessage(ChatColor.RED + "Creative item removed!");
+        }
+    }
+    
+    /**
+     * Handle hanging place events (item frames, paintings, etc.)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onHangingPlace(HangingPlaceEvent event) {
+        Player player = event.getPlayer();
+        if (player == null) return;
+        
+        ItemStack item = player.getInventory().getItemInMainHand();
+        
+        // Skip if admin bypass
+        if (hasAdminBypass(player)) return;
+        
+        // Check if placing hanging entity in creative mode
+        if (player.getGameMode() == GameMode.CREATIVE) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "You cannot place hanging entities while in creative mode!");
+            
+            if (logRemovals) {
+                getLogger().info("Prevented " + player.getName() + " from placing hanging entity in creative mode");
+            }
+            return;
+        }
+        
+        // Check if holding creative item in survival
+        if (isCreativeItem(item) && player.getGameMode() != GameMode.CREATIVE) {
+            event.setCancelled(true);
+            player.getInventory().remove(item);
+            player.sendMessage(ChatColor.RED + "Creative item removed!");
+        }
+    }
+    
+    /**
+     * Handle player interaction (right-click on blocks, etc.)
      */
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onPlayerInteract(PlayerInteractEvent event) {
@@ -581,6 +870,16 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         // Skip if admin bypass
         if (hasAdminBypass(player)) return;
+        
+        // Check for blacklisted items in creative mode
+        if (player.getGameMode() == GameMode.CREATIVE && isBlacklisted(item)) {
+            event.setCancelled(true);
+            if (item != null) {
+                player.getInventory().remove(item);
+            }
+            player.sendMessage(ChatColor.RED + "Blacklisted item removed!");
+            return;
+        }
         
         // Check if interacting with a creative item
         if (isCreativeItem(item) && player.getGameMode() != GameMode.CREATIVE) {
@@ -666,6 +965,11 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Check for creative items on join if not in creative mode
         if (player.getGameMode() != GameMode.CREATIVE && !hasAdminBypass(player)) {
             removeCreativeItems(player);
+        }
+        
+        // Check for blacklisted items in creative mode
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            checkAndRemoveBlacklistedItems(player);
         }
     }
     

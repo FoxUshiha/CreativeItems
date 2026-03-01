@@ -8,3 +8,17 @@ LogRemovals: true
 
 # Whether to allow admins to bypass restrictions
 AdminBypass: true
+
+# BlackList blocks
+# List of materials that creative players (without bypass) cannot hold
+# These items will be instantly removed from their hands
+Blacklist:
+  - 'CHEST'
+  - 'BEDROCK'
+  - 'COMMAND_BLOCK'
+  - 'STRUCTURE_BLOCK'
+  - 'BARRIER'
+  - 'SPAWNER'
+  - 'COPPER_CHEST'
+  - '*_COPPER_CHEST'  # All variants of COPPER_CHEST
+  - '*_SHELF'         # All variants of SHELF
