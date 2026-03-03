@@ -67,6 +67,9 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
     // Track players in creative mode
     private final Set<UUID> creativePlayers = ConcurrentHashMap.newKeySet();
     
+    // Track players currently in creative inventory to prevent middle-click exploits
+    private final Set<UUID> playersInCreativeInventory = ConcurrentHashMap.newKeySet();
+    
     // Config values
     private String creativeLore;
     private boolean logRemovals;
@@ -139,6 +142,9 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         // Start blacklist check task
         startBlacklistCheckTask();
+        
+        // Start creative inventory monitor task
+        startCreativeInventoryMonitor();
         
         getLogger().info("CreativeItem v" + getDescription().getVersion() + " enabled!");
     }
@@ -278,6 +284,61 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
                 }
             }
         }.runTaskTimer(this, 10L, 10L); // Run every 0.5 seconds for immediate removal
+    }
+    
+    /**
+     * Start creative inventory monitor to detect middle-click exploits
+     */
+    private void startCreativeInventoryMonitor() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                        // Check if player has creative inventory open
+                        if (player.getOpenInventory() != null && 
+                            player.getOpenInventory().getTopInventory() != null &&
+                            player.getOpenInventory().getTopInventory().getType() == InventoryType.CREATIVE) {
+                            
+                            // Mark player as being in creative inventory
+                            playersInCreativeInventory.add(player.getUniqueId());
+                            
+                            // Check for any items in player's main inventory that shouldn't be there
+                            // (Items obtained via middle-click or from creative menu)
+                            for (ItemStack item : player.getInventory().getContents()) {
+                                if (item != null && !item.getType().isAir() && !isCreativeItem(item)) {
+                                    // Found a non-tagged item - likely from middle-click
+                                    // Tag it immediately
+                                    addCreativeTag(item);
+                                    
+                                    if (logRemovals) {
+                                        getLogger().info("Tagged item from " + player.getName() + 
+                                            " obtained via creative inventory: " + item.getType().name());
+                                    }
+                                }
+                            }
+                            
+                            // Check armor and offhand too
+                            for (ItemStack item : player.getInventory().getArmorContents()) {
+                                if (item != null && !item.getType().isAir() && !isCreativeItem(item)) {
+                                    addCreativeTag(item);
+                                }
+                            }
+                            
+                            ItemStack offHand = player.getInventory().getItemInOffHand();
+                            if (offHand != null && !offHand.getType().isAir() && !isCreativeItem(offHand)) {
+                                addCreativeTag(offHand);
+                            }
+                        } else {
+                            // Player no longer in creative inventory
+                            playersInCreativeInventory.remove(player.getUniqueId());
+                        }
+                    } else {
+                        playersInCreativeInventory.remove(player.getUniqueId());
+                    }
+                }
+            }
+        }.runTaskTimer(this, 5L, 5L); // Run every 0.25 seconds for immediate detection
     }
     
     /**
@@ -515,20 +576,39 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         ItemStack cursor = event.getCursor();
         ItemStack current = event.getCurrentItem();
         
+        // Skip if admin bypass
+        if (hasAdminBypass(player)) return;
+        
+        // Check for blacklisted items
+        if (isBlacklisted(cursor) || isBlacklisted(current)) {
+            event.setCancelled(true);
+            if (isBlacklisted(cursor)) {
+                event.setCursor(null);
+            }
+            if (isBlacklisted(current)) {
+                event.setCurrentItem(null);
+            }
+            player.sendMessage(ChatColor.RED + "You cannot use blacklisted items in creative!");
+            return;
+        }
+        
         // Check if player is getting a new item (cursor was air, now has item)
         if (cursor != null && !cursor.getType().isAir()) {
             // This is when they pick up from creative menu
             ItemStack newItem = cursor.clone();
-            
-            // Only tag if not admin bypass
-            if (!hasAdminBypass(player)) {
-                addCreativeTag(newItem);
-                event.setCursor(newItem);
-            }
+            addCreativeTag(newItem);
+            event.setCursor(newItem);
         }
         
-        // Allow moving items within creative inventory for non-admin players
-        // This is now permitted
+        // Also tag any items in the current slot that might be picked up
+        if (current != null && !current.getType().isAir() && !isCreativeItem(current)) {
+            ItemStack currentItem = current.clone();
+            addCreativeTag(currentItem);
+            event.setCurrentItem(currentItem);
+        }
+        
+        // Mark player as being in creative inventory
+        playersInCreativeInventory.add(player.getUniqueId());
     }
     
     /**
@@ -562,6 +642,21 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
                 event.setCursor(null);
                 player.sendMessage(ChatColor.RED + "You cannot use blacklisted items in creative!");
                 return;
+            }
+        }
+        
+        // Tag any items being moved within creative inventory
+        if (player.getGameMode() == GameMode.CREATIVE && 
+            (clickedInventory != null && clickedInventory.getType() == InventoryType.CREATIVE)) {
+            if (current != null && !current.getType().isAir() && !isCreativeItem(current)) {
+                ItemStack tagged = current.clone();
+                addCreativeTag(tagged);
+                event.setCurrentItem(tagged);
+            }
+            if (cursor != null && !cursor.getType().isAir() && !isCreativeItem(cursor)) {
+                ItemStack tagged = cursor.clone();
+                addCreativeTag(tagged);
+                event.setCursor(tagged);
             }
         }
         
@@ -634,6 +729,15 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
             return;
         }
         
+        // Tag items being dragged in creative inventory
+        if (player.getGameMode() == GameMode.CREATIVE && 
+            inventory.getType() == InventoryType.CREATIVE && 
+            oldCursor != null && !oldCursor.getType().isAir() && !isCreativeItem(oldCursor)) {
+            ItemStack tagged = oldCursor.clone();
+            addCreativeTag(tagged);
+            // Can't modify cursor during drag, but we'll tag in the monitor task
+        }
+        
         // Check if dragging creative item
         if (isCreativeItem(oldCursor)) {
             // Check if any of the slots are in storage containers
@@ -666,6 +770,11 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         // Skip if admin bypass
         if (hasAdminBypass(player)) return;
+        
+        // Track when player opens creative inventory
+        if (inventory.getType() == InventoryType.CREATIVE) {
+            playersInCreativeInventory.add(player.getUniqueId());
+        }
         
         // Check if opening a storage container
         if (isStorageInventory(inventory.getType())) {
@@ -705,6 +814,17 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
             
             // Remove the item from inventory
             player.getInventory().remove(itemStack);
+            return;
+        }
+        
+        // Check if player is in creative mode and trying to drop any item
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            // Tag the item before it drops (though we'll cancel anyway)
+            if (!isCreativeItem(itemStack)) {
+                addCreativeTag(itemStack);
+            }
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "Creative players cannot drop items!");
         }
     }
     
@@ -915,6 +1035,7 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Switching FROM creative
         if (oldGameMode == GameMode.CREATIVE && newGameMode != GameMode.CREATIVE) {
             creativePlayers.remove(player.getUniqueId());
+            playersInCreativeInventory.remove(player.getUniqueId());
             
             // Restore saved inventory
             if (!hasAdminBypass(player)) {
@@ -986,6 +1107,7 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         savedArmor.remove(uuid);
         savedOffHand.remove(uuid);
         creativePlayers.remove(uuid);
+        playersInCreativeInventory.remove(uuid);
     }
     
     /**
