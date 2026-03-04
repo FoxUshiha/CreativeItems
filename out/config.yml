@@ -1,17 +1,37 @@
 # CreativeItem Configuration
 
-# Lore text for creative items
+# Lore to identify creative items (supports color codes with &)
 CreativeItemLore: "&c&lCreative Item"
 
-# Whether to log creative item removal
+# Whether to log removals of creative items to console
 LogRemovals: true
 
-# Whether to allow admins to bypass restrictions
+# Whether players with creativeitem.admin permission can bypass restrictions
 AdminBypass: true
 
-# BlackList blocks
-# List of materials that creative players (without bypass) cannot hold
-# These items will be instantly removed from their hands
+# Anti-PVP Configuration
+AntiPVP:
+  # Prevent creative players from dealing damage to any entity
+  PreventCreativePVP: true
+  
+  # Prevent mobs from targeting creative players
+  PreventCreativeMobTargeting: true
+  
+  # Prevent creative players from using projectiles (arrows, eggs, snowballs, etc.)
+  PreventCreativeProjectiles: true
+  
+  # Prevent creative players from using TNT and explosions
+  PreventCreativeTNT: true
+  
+  # Prevent creative players from using harmful potions
+  PreventCreativePotions: true
+
+# Blacklist materials that creative players cannot use (supports wildcards: * for any)
+# Examples: 
+#   - "DIAMOND_SWORD" - exact match
+#   - "*TNT*" - any item containing TNT in name
+#   - "LAVA*" - items starting with LAVA
+#   - "*BUCKET" - items ending with BUCKET
 Blacklist:
   - 'CHEST'
   - 'BEDROCK'

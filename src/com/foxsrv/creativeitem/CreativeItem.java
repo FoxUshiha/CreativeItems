@@ -9,17 +9,17 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.entity.ArmorStand;
-import org.bukkit.entity.Entity;
-import org.bukkit.entity.Item;
-import org.bukkit.entity.ItemFrame;
-import org.bukkit.entity.Player;
-import org.bukkit.entity.GlowItemFrame;
+import org.bukkit.entity.*;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemSpawnEvent;
+import org.bukkit.event.entity.EntityTargetEvent;
+import org.bukkit.event.entity.PotionSplashEvent;
+import org.bukkit.event.entity.LingeringPotionSplashEvent;
+import org.bukkit.event.entity.AreaEffectCloudApplyEvent;
 import org.bukkit.event.hanging.HangingPlaceEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCreativeEvent;
@@ -34,11 +34,28 @@ import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerFishEvent;
+import org.bukkit.event.player.PlayerEggThrowEvent;
+import org.bukkit.event.player.PlayerBucketEmptyEvent;
+import org.bukkit.event.player.PlayerBucketFillEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.projectiles.ProjectileSource;
+import org.bukkit.entity.TNTPrimed;
+import org.bukkit.entity.WitherSkull;
+import org.bukkit.entity.Fireball;
+import org.bukkit.entity.SmallFireball;
+import org.bukkit.entity.Arrow;
+import org.bukkit.entity.Trident;
+import org.bukkit.entity.Egg;
+import org.bukkit.entity.Snowball;
+import org.bukkit.entity.EnderPearl;
+import org.bukkit.entity.ThrownPotion;
+import org.bukkit.entity.LingeringPotion;
+import org.bukkit.entity.FishHook;
 
 import java.io.File;
 import java.io.IOException;
@@ -48,7 +65,7 @@ import java.util.stream.Collectors;
 
 /**
  * CreativeItem - Main plugin class
- * Manages creative mode items with special handling
+ * Manages creative mode items with special handling and anti-PVP for creative players
  */
 public class CreativeItem extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
     
@@ -70,10 +87,18 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
     // Track players currently in creative inventory to prevent middle-click exploits
     private final Set<UUID> playersInCreativeInventory = ConcurrentHashMap.newKeySet();
     
+    // Track recently attacked players to prevent creative damage
+    private final Map<UUID, Long> creativeAttackCooldown = new ConcurrentHashMap<>();
+    
     // Config values
     private String creativeLore;
     private boolean logRemovals;
     private boolean adminBypass;
+    private boolean preventCreativePVP;
+    private boolean preventCreativeMobTargeting;
+    private boolean preventCreativeProjectiles;
+    private boolean preventCreativeTNT;
+    private boolean preventCreativePotions;
     private Set<Material> blacklistedMaterials = new HashSet<>();
     private List<MaterialPattern> blacklistPatterns = new ArrayList<>();
     
@@ -146,7 +171,11 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         // Start creative inventory monitor task
         startCreativeInventoryMonitor();
         
+        // Start creative attack cooldown cleanup
+        startAttackCooldownCleanup();
+        
         getLogger().info("CreativeItem v" + getDescription().getVersion() + " enabled!");
+        getLogger().info("Anti-PVP for creative mode: " + (preventCreativePVP ? "ENABLED" : "DISABLED"));
     }
     
     @Override
@@ -213,6 +242,13 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
             config.getString("CreativeItemLore", "&c&lCreative Item"));
         this.logRemovals = config.getBoolean("LogRemovals", true);
         this.adminBypass = config.getBoolean("AdminBypass", true);
+        
+        // Anti-PVP configuration
+        this.preventCreativePVP = config.getBoolean("AntiPVP.PreventCreativePVP", true);
+        this.preventCreativeMobTargeting = config.getBoolean("AntiPVP.PreventCreativeMobTargeting", true);
+        this.preventCreativeProjectiles = config.getBoolean("AntiPVP.PreventCreativeProjectiles", true);
+        this.preventCreativeTNT = config.getBoolean("AntiPVP.PreventCreativeTNT", true);
+        this.preventCreativePotions = config.getBoolean("AntiPVP.PreventCreativePotions", true);
         
         // Load blacklist with pattern support
         blacklistedMaterials.clear();
@@ -339,6 +375,20 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
                 }
             }
         }.runTaskTimer(this, 5L, 5L); // Run every 0.25 seconds for immediate detection
+    }
+    
+    /**
+     * Start creative attack cooldown cleanup
+     */
+    private void startAttackCooldownCleanup() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                long currentTime = System.currentTimeMillis();
+                creativeAttackCooldown.entrySet().removeIf(entry -> 
+                    currentTime - entry.getValue() > 5000); // Remove after 5 seconds
+            }
+        }.runTaskTimer(this, 200L, 200L); // Run every 10 seconds
     }
     
     /**
@@ -1030,6 +1080,11 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
                 player.getInventory().setArmorContents(null);
                 player.getInventory().setItemInOffHand(null);
             }
+            
+            // Notify about anti-PVP
+            if (preventCreativePVP && !hasAdminBypass(player)) {
+                player.sendMessage(ChatColor.YELLOW + "You are in creative mode. PVP is disabled for creative players!");
+            }
         }
         
         // Switching FROM creative
@@ -1056,6 +1111,215 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
                 if (isCreativeItem(offHand)) {
                     removeCreativeTag(offHand);
                 }
+            }
+        }
+    }
+    
+    /**
+     * Handle entity damage events (PVP)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onEntityDamageByEntity(EntityDamageByEntityEvent event) {
+        if (!preventCreativePVP) return;
+        
+        Entity damager = event.getDamager();
+        Entity victim = event.getEntity();
+        
+        // Find the player responsible for the damage
+        Player attackingPlayer = null;
+        
+        if (damager instanceof Player) {
+            attackingPlayer = (Player) damager;
+        } else if (damager instanceof Projectile) {
+            Projectile projectile = (Projectile) damager;
+            ProjectileSource shooter = projectile.getShooter();
+            if (shooter instanceof Player) {
+                attackingPlayer = (Player) shooter;
+            }
+        } else if (damager instanceof TNTPrimed) {
+            TNTPrimed tnt = (TNTPrimed) damager;
+            if (tnt.getSource() instanceof Player) {
+                attackingPlayer = (Player) tnt.getSource();
+            }
+        } else if (damager instanceof WitherSkull) {
+            WitherSkull skull = (WitherSkull) damager;
+            if (skull.getShooter() instanceof Player) {
+                attackingPlayer = (Player) skull.getShooter();
+            }
+        } else if (damager instanceof Fireball) {
+            Fireball fireball = (Fireball) damager;
+            if (fireball.getShooter() instanceof Player) {
+                attackingPlayer = (Player) fireball.getShooter();
+            }
+        } else if (damager instanceof AreaEffectCloud) {
+            // Handle lingering potions
+            AreaEffectCloud cloud = (AreaEffectCloud) damager;
+            if (cloud.getSource() instanceof Player) {
+                attackingPlayer = (Player) cloud.getSource();
+            }
+        }
+        
+        // If we found an attacking player in creative mode, cancel the damage
+        if (attackingPlayer != null && 
+            attackingPlayer.getGameMode() == GameMode.CREATIVE && 
+            !hasAdminBypass(attackingPlayer)) {
+            
+            event.setCancelled(true);
+            
+            // Add to cooldown to prevent message spam
+            if (!creativeAttackCooldown.containsKey(attackingPlayer.getUniqueId())) {
+                attackingPlayer.sendMessage(ChatColor.RED + "You cannot deal damage while in creative mode!");
+                creativeAttackCooldown.put(attackingPlayer.getUniqueId(), System.currentTimeMillis());
+            }
+            
+            if (logRemovals) {
+                getLogger().info("Prevented " + attackingPlayer.getName() + " from damaging " + 
+                    victim.getType().name() + " while in creative mode");
+            }
+        }
+    }
+    
+    /**
+     * Handle potion splash events
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPotionSplash(PotionSplashEvent event) {
+        if (!preventCreativePotions) return;
+        
+        ThrownPotion potion = event.getPotion();
+        ProjectileSource shooter = potion.getShooter();
+        
+        if (shooter instanceof Player) {
+            Player player = (Player) shooter;
+            if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                event.setCancelled(true);
+                
+                if (!creativeAttackCooldown.containsKey(player.getUniqueId())) {
+                    player.sendMessage(ChatColor.RED + "You cannot use potions while in creative mode!");
+                    creativeAttackCooldown.put(player.getUniqueId(), System.currentTimeMillis());
+                }
+                
+                if (logRemovals) {
+                    getLogger().info("Prevented " + player.getName() + " from using potion in creative mode");
+                }
+            }
+        }
+    }
+    
+    /**
+     * Handle lingering potion splash events - CORRIGIDO
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onLingeringPotionSplash(LingeringPotionSplashEvent event) {
+        if (!preventCreativePotions) return;
+        
+        ThrownPotion potion = event.getEntity(); // LingeringPotion extends ThrownPotion
+        ProjectileSource shooter = potion.getShooter();
+        
+        if (shooter instanceof Player) {
+            Player player = (Player) shooter;
+            if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                event.setCancelled(true);
+                potion.remove();
+                
+                if (!creativeAttackCooldown.containsKey(player.getUniqueId())) {
+                    player.sendMessage(ChatColor.RED + "You cannot use lingering potions while in creative mode!");
+                    creativeAttackCooldown.put(player.getUniqueId(), System.currentTimeMillis());
+                }
+            }
+        }
+    }
+    
+    /**
+     * Handle area effect cloud apply (lingering potions)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onAreaEffectCloudApply(AreaEffectCloudApplyEvent event) {
+        if (!preventCreativePotions) return;
+        
+        AreaEffectCloud cloud = event.getEntity();
+        if (cloud.getSource() instanceof Player) {
+            Player player = (Player) cloud.getSource();
+            if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                event.setCancelled(true);
+                cloud.remove();
+            }
+        }
+    }
+    
+    /**
+     * Handle entity target events (prevent mobs from targeting creative players)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onEntityTarget(EntityTargetEvent event) {
+        if (!preventCreativeMobTargeting) return;
+        
+        Entity target = event.getTarget();
+        if (target instanceof Player) {
+            Player player = (Player) target;
+            if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+                event.setCancelled(true);
+            }
+        }
+    }
+    
+    /**
+     * Handle player fishing
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerFish(PlayerFishEvent event) {
+        Player player = event.getPlayer();
+        
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            if (event.getState() == PlayerFishEvent.State.CAUGHT_ENTITY) {
+                Entity caught = event.getCaught();
+                if (caught instanceof LivingEntity) {
+                    event.setCancelled(true);
+                    player.sendMessage(ChatColor.RED + "You cannot catch entities while in creative mode!");
+                }
+            }
+        }
+    }
+    
+    /**
+     * Handle egg throw
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerEggThrow(PlayerEggThrowEvent event) {
+        Player player = event.getPlayer();
+        
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            event.setHatching(false);
+            event.setNumHatches((byte) 0);
+        }
+    }
+    
+    /**
+     * Handle bucket empty (for lava/water)
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerBucketEmpty(PlayerBucketEmptyEvent event) {
+        Player player = event.getPlayer();
+        
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            // Allow placing water/lava in creative, but log it
+            if (logRemovals) {
+                getLogger().info(player.getName() + " placed " + event.getBucket() + " in creative mode");
+            }
+        }
+    }
+    
+    /**
+     * Handle bucket fill
+     */
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerBucketFill(PlayerBucketFillEvent event) {
+        Player player = event.getPlayer();
+        
+        if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
+            // Allow filling buckets in creative, but log it
+            if (logRemovals) {
+                getLogger().info(player.getName() + " filled " + event.getBucket() + " in creative mode");
             }
         }
     }
@@ -1092,6 +1356,11 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         if (player.getGameMode() == GameMode.CREATIVE && !hasAdminBypass(player)) {
             checkAndRemoveBlacklistedItems(player);
         }
+        
+        // Notify about anti-PVP if in creative
+        if (player.getGameMode() == GameMode.CREATIVE && preventCreativePVP && !hasAdminBypass(player)) {
+            player.sendMessage(ChatColor.YELLOW + "You are in creative mode. PVP is disabled for creative players!");
+        }
     }
     
     /**
@@ -1108,6 +1377,7 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         savedOffHand.remove(uuid);
         creativePlayers.remove(uuid);
         playersInCreativeInventory.remove(uuid);
+        creativeAttackCooldown.remove(uuid);
     }
     
     /**
@@ -1125,6 +1395,7 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         if (args.length == 0) {
             player.sendMessage(ChatColor.GOLD + "=== CreativeItem Commands ===");
             player.sendMessage(ChatColor.YELLOW + "/ci remove " + ChatColor.GRAY + "- Remove creative tag from item in hand");
+            player.sendMessage(ChatColor.YELLOW + "/ci info " + ChatColor.GRAY + "- Show plugin information");
             return true;
         }
         
@@ -1149,7 +1420,20 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
             return true;
         }
         
-        player.sendMessage(ChatColor.RED + "Unknown subcommand. Use /ci remove");
+        if (args[0].equalsIgnoreCase("info")) {
+            player.sendMessage(ChatColor.GOLD + "=== CreativeItem Info ===");
+            player.sendMessage(ChatColor.YELLOW + "Version: " + ChatColor.WHITE + getDescription().getVersion());
+            player.sendMessage(ChatColor.YELLOW + "Anti-PVP: " + (preventCreativePVP ? 
+                ChatColor.GREEN + "Enabled" : ChatColor.RED + "Disabled"));
+            player.sendMessage(ChatColor.YELLOW + "Your GameMode: " + 
+                (player.getGameMode() == GameMode.CREATIVE ? 
+                    ChatColor.GREEN + "Creative" : ChatColor.GRAY + player.getGameMode().name()));
+            player.sendMessage(ChatColor.YELLOW + "Admin Bypass: " + 
+                (hasAdminBypass(player) ? ChatColor.GREEN + "Yes" : ChatColor.RED + "No"));
+            return true;
+        }
+        
+        player.sendMessage(ChatColor.RED + "Unknown subcommand. Use /ci remove or /ci info");
         return true;
     }
     
@@ -1159,6 +1443,7 @@ public class CreativeItem extends JavaPlugin implements Listener, CommandExecuto
         
         if (args.length == 1) {
             completions.add("remove");
+            completions.add("info");
             return filter(completions, args[0]);
         }
         
